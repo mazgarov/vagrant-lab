@@ -1,0 +1,215 @@
+# Vagrant configuration syntax version 2.
+Vagrant.configure("2") do |config|
+
+  # ----------------------------------------------------------
+  # 1. VM IDENTITY AND OPERATING SYSTEM
+  # ----------------------------------------------------------
+
+  # Define the Vagrant machine name.
+  config.vm.define "docker-vm" do |vm|
+
+    # Use Ubuntu 24.04 LTS.
+    vm.vm.box = "bento/ubuntu-24.04"
+
+    # Pin the box version for reproducible builds.
+    vm.vm.box_version = "202508.03.0"
+
+    # Set the hostname inside Ubuntu.
+    vm.vm.hostname = "docker-vm"
+
+    # --------------------------------------------------------
+    # 2. VIRTUAL HARDWARE
+    # --------------------------------------------------------
+
+    vm.vm.provider :libvirt do |libvirt|
+
+      # Allocate 2 GB of RAM.
+      libvirt.memory = 2048
+
+      # Allocate 2 virtual CPUs.
+      libvirt.cpus = 2
+
+      # Configure an 80 GB virtual disk.
+      # The guest partition and filesystem are expanded below.
+      libvirt.machine_virtual_size = 80
+    end
+
+    # --------------------------------------------------------
+    # 3. AUTOMATED PROVISIONING
+    # --------------------------------------------------------
+
+    # Change this to your real Zabbix server or proxy address.
+    zabbix_server = ""
+
+    # Stop before provisioning if the address is still a placeholder.
+    # This prevents accidental installation with an invalid setting.
+    raise "Set zabbix_server to your real server IP address" \
+      if zabbix_server == "REPLACE_WITH_ZABBIX_SERVER_IP"
+
+    vm.vm.provision "shell",
+      env: {
+        "ZABBIX_SERVER" => zabbix_server
+      },
+      inline: <<-SHELL
+
+      # Stop on command errors.
+      set -e
+
+      # ======================================================
+      # 4. UPDATE AND UPGRADE UBUNTU
+      # ======================================================
+
+      # Refresh the package index.
+      apt-get update
+
+      # Install available package upgrades non-interactively.
+      DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+      # Install tools for disk expansion and repository setup.
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        ca-certificates \
+        curl \
+        cloud-guest-utils \
+        lvm2
+
+      # ======================================================
+      # 5. EXPAND THE ROOT FILESYSTEM TO USE THE 80 GB DISK
+      # ======================================================
+
+      # Grow partition 3 to fill the virtual disk.
+      # The base box uses /dev/vda3 for its LVM physical volume.
+      growpart /dev/vda 3
+
+      # Tell LVM that the physical volume now has more space.
+      pvresize /dev/vda3
+
+      # Find the free space in the Ubuntu volume group.
+      VG_FREE=$(vgs --noheadings -o vg_free --units b --nosuffix ubuntu-vg \
+        | awk '{printf "%.0f", $1}')
+
+      # Allocate all remaining free space to the root logical volume.
+      # -r also expands the filesystem.
+      if [ "$VG_FREE" -gt 0 ]; then
+        lvextend -l +100%FREE -r /dev/ubuntu-vg/ubuntu-lv
+      fi
+
+      # ======================================================
+      # 6. INSTALL DOCKER ENGINE AND COMPOSE
+      # ======================================================
+
+      # Create the directory for APT repository signing keys.
+      install -m 0755 -d /etc/apt/keyrings
+
+      # Download Docker's official repository signing key.
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc
+
+      chmod a+r /etc/apt/keyrings/docker.asc
+
+      # Add the Docker repository for this Ubuntu release
+      # and the guest's architecture.
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+      # Refresh package metadata after adding the repository.
+      apt-get update
+
+      # Install Docker Engine, CLI, containerd, Buildx and Compose.
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
+
+      # Start Docker now and enable it after reboots.
+      systemctl enable --now docker
+
+      # Permit the vagrant account to run Docker without sudo.
+      # WARNING: Docker group membership grants effectively
+      # root-level privileges inside this VM.
+      usermod -aG docker vagrant
+
+      # ======================================================
+      # 7. INSTALL ZABBIX AGENT 2
+      # ======================================================
+
+      # Install the official Zabbix 7.0 repository package
+      # for Ubuntu 24.04.
+      curl -fsSL \
+        https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_7.0+ubuntu24.04_all.deb \
+        -o /tmp/zabbix-release.deb
+
+      dpkg -i /tmp/zabbix-release.deb
+      apt-get update
+
+      DEBIAN_FRONTEND=noninteractive apt-get install -y zabbix-agent2
+
+      # ======================================================
+      # 8. CREATE AND KEEP THE ZABBIX PSK
+      # ======================================================
+
+      # Store the secret inside the VM.
+      # Generate it only if it doesn't already exist.
+      # Re-running provisioning therefore keeps the same key.
+      if [ ! -s /etc/zabbix/encrypt.psk ]; then
+        umask 077
+        openssl rand -hex 32 > /etc/zabbix/encrypt.psk
+      fi
+
+      # The agent needs read access, but ordinary users should not.
+      chown root:zabbix /etc/zabbix/encrypt.psk
+      chmod 0640 /etc/zabbix/encrypt.psk
+
+      # ======================================================
+      # 9. CONFIGURE ZABBIX AGENT 2
+      # ======================================================
+
+      # Update a setting while removing older active definitions.
+      # This avoids duplicate settings on repeated provisioning.
+      set_agent_option() {
+        key="$1"
+        value="$2"
+        file="/etc/zabbix/zabbix_agent2.conf"
+
+        sed -i -E \
+          "/^[[:space:]]*#?[[:space:]]*${key}[[:space:]]*=/d" \
+          "$file"
+
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+      }
+
+      # Allow passive checks only from the configured server/proxy.
+      set_agent_option "Server" "$ZABBIX_SERVER"
+
+      # Set the destination for active checks.
+      set_agent_option "ServerActive" "$ZABBIX_SERVER"
+
+      # Must match the Host name configured in the Zabbix frontend.
+      set_agent_option "Hostname" "docker-vm"
+
+      # Require PSK encryption for active and passive connections.
+      set_agent_option "TLSConnect" "psk"
+      set_agent_option "TLSAccept" "psk"
+
+      # Public identifier and path to the local secret file.
+      set_agent_option "TLSPSKIdentity" "docker-vm-psk"
+      set_agent_option "TLSPSKFile" "/etc/zabbix/encrypt.psk"
+
+      # Validate the configuration and restart the service.
+      zabbix_agent2 -T -c /etc/zabbix/zabbix_agent2.conf
+      systemctl enable zabbix-agent2
+      systemctl restart zabbix-agent2
+
+      # Confirm that the service is running.
+      systemctl is-active --quiet zabbix-agent2
+
+      echo "Provisioning completed successfully."
+      echo "VM hostname: docker-vm"
+      echo "Zabbix server/proxy: $ZABBIX_SERVER"
+      echo "Zabbix PSK identity: docker-vm-psk"
+      echo "Zabbix PSK file: /etc/zabbix/encrypt.psk"
+
+      SHELL
+  end
+end

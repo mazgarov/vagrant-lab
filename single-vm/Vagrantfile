@@ -1,0 +1,26 @@
+
+# Start the Vagrant configuration using configuration syntax version 2.
+Vagrant.configure("2") do |config|
+
+  # Specify the base image (box) used to create the virtual machine.
+  # Vagrant downloads this box if it is not already available locally.
+  config.vm.box = "bento/ubuntu-24.04"
+
+  # Set the hostname that Ubuntu will use inside the virtual machine.
+  config.vm.hostname = "docker-vm"
+
+  # Configure VM resources specifically for the libvirt provider.
+  # The provider is the software Vagrant uses to create and manage VMs.
+  config.vm.provider :libvirt do |libvirt|
+
+    # Allocate 2048 MB (2 GB) of RAM to the virtual machine.
+    libvirt.memory = 2048
+
+    # Allocate 2 virtual CPUs to the virtual machine.
+    libvirt.cpus = 2
+
+  # End the libvirt-specific configuration block.
+  end
+
+# End the main Vagrant configuration block.
+end

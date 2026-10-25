@@ -1,0 +1,335 @@
+# frozen_string_literal: true
+#
+# Vagrantfile
+#
+# Purpose:
+#   Create five Ubuntu VMs on the Ubuntu KVM/libvirt host.
+#   One VM will be the Kubernetes control-plane node (master).
+#   Four VMs will become Kubernetes worker nodes.
+#
+# Important:
+#   This file prepares the operating systems only.
+#   Kubernetes will be installed and configured in a later stage.
+
+# -------------------------------------------------------------------
+# 1. DEFINE THE MACHINES
+# -------------------------------------------------------------------
+#
+# Each entry describes one VM:
+#   :name - VM hostname and Vagrant machine name
+#   :ip   - stable IP address on the private cluster network
+#
+# All five VMs use the same provisioning procedure below.
+#
+# Network:
+#   192.168.100.0/24 is reserved here for communication between nodes.
+#   Check that this subnet does not overlap with an existing network
+#   on your host or infrastructure before using it.
+
+NODES = [
+  { name: "k8s-master",  ip: "192.168.100.11", lan_ip: "172.16.3.81" },
+  { name: "k8s-worker1", ip: "192.168.100.12", lan_ip: "172.16.3.82" },
+  { name: "k8s-worker2", ip: "192.168.100.13", lan_ip: "172.16.3.83" },
+  { name: "k8s-worker3", ip: "192.168.100.14", lan_ip: "172.16.3.84" },
+  { name: "k8s-worker4", ip: "192.168.100.15", lan_ip: "172.16.3.85" }
+].freeze
+
+# -------------------------------------------------------------------
+# 2. COMMON SETTINGS
+# -------------------------------------------------------------------
+
+# Use the same Ubuntu box that worked in the previous lab.
+# Pinning the version makes the base image reproducible.
+UBUNTU_BOX = "bento/ubuntu-24.04"
+UBUNTU_BOX_VERSION = "202508.03.0"
+
+# Zabbix server or proxy address.
+# Change this value if your Zabbix server/proxy address changes.
+ZABBIX_SERVER = ""
+
+# -------------------------------------------------------------------
+# 3. PROVISIONING SCRIPT
+# -------------------------------------------------------------------
+#
+# This script runs inside each guest VM as root.
+#
+# It:
+#   1. Updates the APT package index.
+#   2. Installs tools needed for disk expansion.
+#   3. Expands the Ubuntu root filesystem to use the 80 GB disk.
+#   4. Installs Docker Engine.
+#   5. Installs Zabbix Agent 2.
+#   6. Creates a unique PSK file for this VM.
+#   7. Configures and starts Zabbix Agent 2.
+#
+# We intentionally do not run "apt-get upgrade" on every build.
+# We can update the base image and packages deliberately later.
+
+PROVISION_SCRIPT = <<-'SHELL'
+  set -e
+
+  # ---------------------------------------------------------------
+  # A. Update package indexes and install prerequisite utilities
+  # ---------------------------------------------------------------
+
+  apt-get update
+
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates \
+    curl \
+    cloud-guest-utils \
+    lvm2 \
+    openssl
+
+  # ---------------------------------------------------------------
+  # B. Expand the root filesystem
+  # ---------------------------------------------------------------
+  #
+  # The virtual disk is 80 GB, but the original Ubuntu box may have
+  # a smaller root filesystem.
+  #
+  # For the pinned box used in this lab:
+  #   /dev/vda3                  = LVM physical partition
+  #   ubuntu-vg                  = LVM volume group
+  #   ubuntu-vg/ubuntu-lv        = root logical volume
+  #
+  # growpart expands partition 3.
+  # pvresize makes the additional partition space available to LVM.
+  # lvextend and -r expand the root logical volume and filesystem.
+  #
+  # These device names match the box we tested. If you change the
+  # base box or its disk layout, inspect lsblk before reusing this.
+
+  growpart /dev/vda 3
+  pvresize /dev/vda3
+
+  # Use all currently free space in this volume group for the root LV.
+  # This is appropriate for this lab because we have no other LVs
+  # planned in ubuntu-vg.
+  VG_FREE=$(vgs --noheadings -o vg_free --units b --nosuffix ubuntu-vg \
+    | awk '{printf "%.0f", $1}')
+
+  if [ "$VG_FREE" -gt 0 ]; then
+    lvextend -l +100%FREE -r /dev/ubuntu-vg/ubuntu-lv
+  fi
+
+  # ---------------------------------------------------------------
+  # C. Install Docker Engine from the official Docker repository
+  # ---------------------------------------------------------------
+
+  install -m 0755 -d /etc/apt/keyrings
+
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  # Determine the Ubuntu codename from the guest OS itself.
+  UBUNTU_CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin
+
+  # Start Docker now and enable it at boot.
+  systemctl enable --now docker
+
+  # Allow the Vagrant user to run Docker commands without sudo.
+  # The new group membership applies after a fresh login.
+  usermod -aG docker vagrant
+
+  # ---------------------------------------------------------------
+  # D. Install Zabbix Agent 2 from the official Zabbix 7.0 repository
+  # ---------------------------------------------------------------
+
+  curl -fsSL \
+    https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_7.0+ubuntu24.04_all.deb \
+    -o /tmp/zabbix-release.deb
+
+  dpkg -i /tmp/zabbix-release.deb
+  apt-get update
+
+  DEBIAN_FRONTEND=noninteractive apt-get install -y zabbix-agent2
+
+  # ---------------------------------------------------------------
+  # E. Create a unique Zabbix PSK for this VM
+  # ---------------------------------------------------------------
+  #
+  # The PSK is generated inside the guest, not in the Vagrantfile.
+  # It is created only if the file does not already exist.
+  #
+  # Re-running "vagrant provision" therefore keeps the same key.
+  # Destroying and recreating a VM generates a new key.
+  #
+  # Retrieve the key later using:
+  #   vagrant ssh k8s-master -c 'sudo cat /etc/zabbix/encrypt.psk'
+  #
+  # Each Zabbix host must be configured with the matching identity
+  # and PSK in the Zabbix frontend.
+
+  if [ ! -s /etc/zabbix/encrypt.psk ]; then
+    umask 077
+    openssl rand -hex 32 > /etc/zabbix/encrypt.psk
+  fi
+
+  chown root:zabbix /etc/zabbix/encrypt.psk
+  chmod 0640 /etc/zabbix/encrypt.psk
+
+  # ---------------------------------------------------------------
+  # F. Configure Zabbix Agent 2
+  # ---------------------------------------------------------------
+  #
+  # NODE_NAME and ZABBIX_SERVER are passed in by Vagrant for each VM.
+  #
+  # Server:
+  #   Zabbix server/proxy allowed to make passive agent checks.
+  #
+  # ServerActive:
+  #   Zabbix server/proxy to which the agent connects for active checks.
+  #
+  # TLSPSKIdentity:
+  #   Identity that must match the corresponding Zabbix host settings.
+  #
+  # TLSPSKFile:
+  #   File containing this guest's secret PSK.
+
+  set_agent_option() {
+    key="$1"
+    value="$2"
+    file="/etc/zabbix/zabbix_agent2.conf"
+
+    # Remove existing active or commented definitions of this option.
+    sed -i -E \
+      "/^[[:space:]]*#?[[:space:]]*${key}[[:space:]]*=/d" \
+      "$file"
+
+    # Add exactly one active definition.
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  }
+
+  set_agent_option "Server" "$ZABBIX_SERVER"
+  set_agent_option "ServerActive" "$ZABBIX_SERVER"
+  set_agent_option "Hostname" "$NODE_NAME"
+  set_agent_option "TLSConnect" "psk"
+  set_agent_option "TLSAccept" "psk"
+  set_agent_option "TLSPSKIdentity" "${NODE_NAME}-psk"
+  set_agent_option "TLSPSKFile" "/etc/zabbix/encrypt.psk"
+
+  # Validate the configuration before restarting the agent.
+  zabbix_agent2 -T -c /etc/zabbix/zabbix_agent2.conf
+
+  systemctl enable zabbix-agent2
+  systemctl restart zabbix-agent2
+  systemctl is-active --quiet zabbix-agent2
+
+  # ---------------------------------------------------------------
+  # G. Report a short completion summary
+  # ---------------------------------------------------------------
+
+  echo "Provisioning completed successfully."
+  echo "Hostname: ${NODE_NAME}"
+  echo "Zabbix server/proxy: ${ZABBIX_SERVER}"
+  echo "Zabbix PSK identity: ${NODE_NAME}-psk"
+  echo "Zabbix PSK file: /etc/zabbix/encrypt.psk"
+SHELL
+
+# -------------------------------------------------------------------
+# 4. VAGRANT CONFIGURATION
+# -------------------------------------------------------------------
+
+Vagrant.configure("2") do |config|
+
+  # Common Ubuntu image settings inherited by the defined machines.
+  config.vm.box = UBUNTU_BOX
+  config.vm.box_version = UBUNTU_BOX_VERSION
+
+  # Create each VM using the same configuration pattern.
+  NODES.each do |node|
+
+    config.vm.define node[:name] do |vm|
+
+      # Set the hostname inside Ubuntu.
+      vm.vm.hostname = node[:name]
+
+      # Add a second network interface with a stable IP address.
+      #
+      # Vagrant/libvirt also provides its management network, which
+      # Vagrant uses to connect to the guest over SSH.
+      #
+      # This private network is for traffic between cluster nodes.
+      vm.vm.network "private_network", ip: node[:ip]
+
+      # TEMPORARY LAN TEST — k8s-master only.
+      # Uses macvtap in bridge mode through the physical NIC.
+      # This is not a Linux br0 bridge.
+      # Remove this block after the LAN networking experiment.
+      if node[:lan_ip]
+        vm.vm.network :public_network,
+          dev: "ens18",
+          mode: "bridge",
+          type: "direct",
+          ip: node[:lan_ip],
+          netmask: "255.255.255.224"
+      end
+
+      # Virtual hardware.
+      # These are initial values, not permanent limits.
+      # We can change them later if the workload requires it.
+      vm.vm.provider :libvirt do |libvirt|
+        libvirt.cpus = 2
+        libvirt.memory = 2048
+        libvirt.machine_virtual_size = 80
+      end
+
+      # Run the same provisioning script on every VM, but pass its
+      # own hostname and the configured Zabbix server/proxy address.
+      vm.vm.provision "shell",
+        env: {
+          "NODE_NAME" => node[:name],
+          "ZABBIX_SERVER" => ZABBIX_SERVER
+        },
+        inline: PROVISION_SCRIPT
+
+
+
+      # TEMPORARY LAN TEST: persistent return route to the Windows subnet.
+      # Assumes the LAN interface is eth2 and the Windows subnet is 172.16.4.0/24.
+      # Remove this provisioner after the LAN networking experiment.
+      vm.vm.provision "shell",
+        inline: <<-SHELL
+          set -eu
+
+          cat > /etc/systemd/system/lan-return-route.service <<'EOF'
+[Unit]
+Description=Temporary route to Windows LAN subnet
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ip route replace 172.16.4.0/24 via 172.16.3.66 dev eth2
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+          systemctl daemon-reload
+          systemctl enable lan-return-route.service
+          systemctl restart lan-return-route.service
+        SHELL
+
+
+
+    end
+  end
+end
